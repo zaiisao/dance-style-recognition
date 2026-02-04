@@ -8,6 +8,8 @@ from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 import trimesh
 
+from visualizer import render_debug_video, plot_volume_trend
+
 def stage_a_nlf_implementation(frame, model, device="cuda"):
     # Preprocess image: Convert OpenCV (H, W, C) -> Torch (C, H, W)
     # Replaces: image = torchvision.io.read_image(image_path).to(device)
@@ -219,6 +221,16 @@ def main():
     print("Video processing complete.")
 
     verify_pipeline_integrity(all_joints, all_volumes, floor_model)
+
+    print("\n--- GENERATING VISUAL DEBUG ASSETS ---")
+    
+    # 1. Volume Graph
+    plot_volume_trend(all_volumes)
+    
+    # 2. Digital Twin Video
+    # Note: Ensure 'all_joints' contains clean (N, 3) arrays, not None
+    # (The logic I gave you previously ensures this structure)
+    render_debug_video(video_path, all_joints, floor_model)
 
 if __name__ == "__main__":
     main()
