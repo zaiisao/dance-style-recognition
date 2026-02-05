@@ -8,6 +8,7 @@ from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 import trimesh
 
+from lma_extractor import LMAExtractor
 from visualizer import render_comprehensive_dashboard
 
 def stage_a_nlf_implementation(frame, model, device="cuda"):
@@ -129,6 +130,112 @@ def verify_pipeline_integrity(all_joints, all_volumes, floor_model):
     else:
         print("    [!] CRITICAL: No valid volumes calculated.")
         
+import numpy as np
+import matplotlib.pyplot as plt
+
+def verify_lma_integrity(npy_path):
+    print(f"--- VERIFYING: {npy_path} ---")
+    
+    # [FIX] Load Dictionary format properly
+    try:
+        data = np.load(npy_path, allow_pickle=True).item()
+    except Exception:
+        print("[!] Fatal: Could not load dictionary. File might be corrupted.")
+        return
+
+    # Basic setup
+    keys = list(data.keys())
+    n_frames = len(data[keys[0]])
+    print(f"Loaded {n_frames} frames. Keys: {keys}")
+    
+    # ---------------------------------------------------------
+    # 1. PHYSICAL UNIT CHECK (Checking 'weight' / Kinetic Energy)
+    # ---------------------------------------------------------
+    # Weight = Speed^2. 
+    # If units are mm, Speed is 1000x -> Weight is 1,000,000x larger.
+    
+    weight_feat = data.get('weight', np.zeros(n_frames))
+    max_val = np.max(weight_feat)
+    
+    print("\n[1] Physical Unit Scaling Check")
+    if max_val > 1000:
+        print(f"    [!] WARNING: Max Energy is {max_val:.2f}.")
+        print("        Likely Unit Error: Data seems to be in MILLIMETERS.")
+        print("        LMA standard is METERS. Divide inputs by 1000.0 before extraction.")
+    elif max_val < 1e-4:
+        print(f"    [!] WARNING: Max value is {max_val:.2e}. Data is vanishingly small.")
+    else:
+        print(f"    [OK] Value range looks consistent with Meters/Seconds.")
+        print(f"         Max Energy Value: {max_val:.3f}")
+
+    # ---------------------------------------------------------
+    # 2. GEOMETRIC LOGIC CHECK (Checking 'space')
+    # ---------------------------------------------------------
+    # Space = Path_Length / Displacement.
+    # By definition, this MUST be >= 1.0 (Triangle Inequality).
+    
+    space_feat = data.get('space', np.zeros(n_frames))
+    
+    print("\n[2] Geometric Logic Check")
+    if np.any(space_feat < 0.99): # Allow tiny float error
+        print(f"    [!] FAIL: Found Space ratios < 1.0. (Min: {np.min(space_feat):.3f})")
+    elif np.isnan(space_feat).any():
+        print("    [!] FAIL: NaNs found. (Division by zero in Displacement?)")
+    else:
+        print("    [OK] Geometry looks valid (All Space Ratios >= 1.0).")
+
+    # ---------------------------------------------------------
+    # 3. SHAPE FLOW CHECK
+    # ---------------------------------------------------------
+    # Note: Our extractor saved 'Shape Flow' (Derivative), not raw Volume.
+    # So we check if the derivative is non-zero (proving the volume changed).
+    
+    shape_flow = data.get('shape', np.zeros(n_frames))
+    
+    print("\n[3] Body Volume Flow Check")
+    if np.allclose(shape_flow, 0):
+        print("    [!] FAIL: Shape Flow is flat zero. Convex Hull might have failed.")
+    else:
+        print(f"    [OK] Volume changes detected (Min flow: {np.min(shape_flow):.4f}, Max flow: {np.max(shape_flow):.4f})")
+
+    # ---------------------------------------------------------
+    # 4. TEMPORAL DYNAMICS CHECK
+    # ---------------------------------------------------------
+    print("\n[4] Temporal Dynamics Check")
+    dead_count = 0
+    for k in keys:
+        var = np.var(data[k])
+        if var < 1e-6:
+            print(f"    [!] WARNING: Feature '{k}' is static (Zero Variance).")
+            dead_count += 1
+            
+    if dead_count == 0:
+        print("    [OK] All features show temporal evolution.")
+
+    # ---------------------------------------------------------
+    # 5. VISUALIZATION
+    # ---------------------------------------------------------
+    print("\n[5] Generating Visualization...")
+    plt.figure(figsize=(12, 6))
+    
+    # Plot normalized features to compare trends
+    for k in keys:
+        sig = data[k]
+        if np.std(sig) > 1e-6:
+            # Z-score normalization for cleaner plotting
+            norm_sig = (sig - np.mean(sig)) / np.std(sig)
+            plt.plot(norm_sig, label=k, alpha=0.8, linewidth=1.5)
+    
+    plt.title("LMA Feature Evolution (Normalized)")
+    plt.xlabel("Frame")
+    plt.ylabel("Z-Score")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    output_img = "lma_verification_plot.png"
+    plt.savefig(output_img)
+    print(f"    Saved plot to {output_img}")
+
 def main():
     video_path = "/home/sogang/mnt/db_1/jaehoon/nsfw_datasets/sfw/kinetics-dataset/k700-2020/train/cartwheeling/_Ar-OVgeCvA_000004_000014.mp4" # Replaces single image path
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -155,86 +262,136 @@ def main():
 
     last_valid_volume = 0.0
 
-    with tqdm(total=min(total_frames, max_frames), desc="Processing Frames", unit="frame") as pbar:
-        while cap.isOpened():
-            if len(all_joints) >= max_frames:
-                print(f"Reached limit of {max_frames} frames.")
-                break
+    should_use_debug_data = True
+    if should_use_debug_data:
+        data = np.load("debug_data.npz", allow_pickle=True)
+        all_joints = data['joints']
+        all_volumes = data['volumes']
+        floor_params = data['floor'] # Now you have the (N, 2) array of slope/intercept
 
-            ret, frame = cap.read()
-            if not ret:
-                break
+        def recreate_floor_model(slope, intercept):
+            # 1. Create a raw, untrained model
+            model = QuantileRegressor()
             
-            # 1. Floor Estimation
-            floor_model, _, current_scene_cloud = stage_b_floor_estimation(frame, moge_model, device=device)
-            all_floor_models.append(floor_model)
+            # 2. Manually inject the "learned" attributes
+            # Note: Scikit-learn expects coef_ to be an array, even for 1D
+            model.coef_ = np.array([slope]) 
+            model.intercept_ = intercept
+            
+            # 3. (Optional) Trick Scikit-learn's validation checks
+            # Some versions check if 'n_features_in_' exists to confirm fitting
+            model.n_features_in_ = 1 
+            
+            return model
 
-            scene_cloud = current_scene_cloud
+        # Usage Example with your loaded data:
+        slope, intercept = floor_params[0] # Get frame 0
+        floor_model = recreate_floor_model(slope, intercept)
+    else:
+        with tqdm(total=min(total_frames, max_frames), desc="Processing Frames", unit="frame") as pbar:
+            while cap.isOpened():
+                if len(all_joints) >= max_frames:
+                    print(f"Reached limit of {max_frames} frames.")
+                    break
 
-            # 2. Pose Estimation
-            joints3d, vertices3d = stage_a_nlf_implementation(frame, nlf_model, device=device)
-            
-            joints_np = None
-            current_vol = last_valid_volume
-            
-            if len(vertices3d) > 0 and len(vertices3d[0]) > 0:
-                verts_np = vertices3d[0].cpu().numpy()
-                joints_np = joints3d[0].cpu().numpy()
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                if verts_np.ndim == 3:
-                    verts_np = verts_np[0]
-                if joints_np.ndim == 3:
-                    joints_np = joints_np[0]
-                
-                if np.mean(np.abs(verts_np[:, 2])) > 10.0: 
-                    verts_np /= 1000.0
-                    joints_np /= 1000.0
-                
-                all_vertices.append(verts_np)
+                # 1. Floor Estimation
+                floor_model, _, current_scene_cloud = stage_b_floor_estimation(frame, moge_model, device=device)
+                all_floor_models.append(floor_model)
 
-                # Volume Calculation
-                try:
-                    # Trimesh is robust, but don't force 'is_watertight' for open clothing meshes
-                    mesh = trimesh.convex.convex_hull(verts_np)
-                    current_vol = mesh.volume
-                    last_valid_volume = current_vol
-                except Exception:
-                    # If it fails, rely on the last known good volume (gap filling)
-                    pass
-            else:
-                all_vertices.append(None)
-            
-            if joints_np is not None:
-                all_joints.append(joints_np)
-            else:
-                all_joints.append([]) # Keep list length consistent
-            
-            all_volumes.append(current_vol)
+                scene_cloud = current_scene_cloud
 
-            # --- METRICS ---
-            if joints_np is not None:
-                # FIX: Array is (24, 3), so [0] gives the full Pelvis vector (x,y,z)
-                pelvis_pos = joints_np[0] 
+                # 2. Pose Estimation
+                joints3d, vertices3d = stage_a_nlf_implementation(frame, nlf_model, device=device)
                 
-                # Predict Floor Y (Height) at Pelvis Z (Depth)
-                floor_y = floor_model.predict(pelvis_pos[2].reshape(-1, 1))[0]
-                height_above_floor = floor_y - pelvis_pos[1] # Y is Down
+                joints_np = None
+                current_vol = last_valid_volume
                 
-                pbar.set_postfix(h=f"{height_above_floor:.2f}m", vol=f"{current_vol:.3f}")
-            else:
-                pbar.set_postfix(status="No Det")
-            
-            pbar.update(1)
-            
-    cap.release()
-    print("Video processing complete.")
+                if len(vertices3d) > 0 and len(vertices3d[0]) > 0:
+                    verts_np = vertices3d[0].cpu().numpy()
+                    joints_np = joints3d[0].cpu().numpy()
+                    
+                    if verts_np.ndim == 3:
+                        verts_np = verts_np[0]
+                    if joints_np.ndim == 3:
+                        joints_np = joints_np[0]
+                    
+                    if np.mean(np.abs(verts_np[:, 2])) > 10.0: 
+                        verts_np /= 1000.0
+                        joints_np /= 1000.0
+                    
+                    all_vertices.append(verts_np)
+
+                    # Volume Calculation
+                    try:
+                        # Trimesh is robust, but don't force 'is_watertight' for open clothing meshes
+                        mesh = trimesh.convex.convex_hull(verts_np)
+                        current_vol = mesh.volume
+                        last_valid_volume = current_vol
+                    except Exception:
+                        # If it fails, rely on the last known good volume (gap filling)
+                        pass
+                else:
+                    all_vertices.append(None)
+                
+                if joints_np is not None:
+                    all_joints.append(joints_np)
+                else:
+                    all_joints.append([]) # Keep list length consistent
+                
+                all_volumes.append(current_vol)
+
+                # --- METRICS ---
+                if joints_np is not None:
+                    # FIX: Array is (24, 3), so [0] gives the full Pelvis vector (x,y,z)
+                    pelvis_pos = joints_np[0] 
+                    
+                    # Predict Floor Y (Height) at Pelvis Z (Depth)
+                    floor_y = floor_model.predict(pelvis_pos[2].reshape(-1, 1))[0]
+                    height_above_floor = floor_y - pelvis_pos[1] # Y is Down
+                    
+                    pbar.set_postfix(h=f"{height_above_floor:.2f}m", vol=f"{current_vol:.3f}")
+                else:
+                    pbar.set_postfix(status="No Det")
+                
+                pbar.update(1)
+                
+        cap.release()
+        print("Video processing complete.")
 
     verify_pipeline_integrity(all_joints, all_volumes, floor_model)
 
-    print("\n--- GENERATING VISUAL DEBUG ASSETS ---")
+    # 1. Initialize Extractor
+    extractor = LMAExtractor(window_size=10, fps=fps)
+    
+    # 2. Extract Features
+    # This converts your raw (Frames, 24, 3) joints into (Frames, 55) LMA descriptors
+    lma_features = extractor.extract_all_features(all_joints, all_volumes)
+    
+    print(f"[-] Feature Extraction Complete")
+    print(f"    Input Frames:  {len(all_joints)}")
+    
+    # [FIX] Handle Dictionary output (No .shape attribute)
+    print(f"    Output Keys:   {list(lma_features.keys())}")
+    
+    # Check length of the first feature (e.g., 'weight') to confirm sequence length
+    first_key = list(lma_features.keys())[0]
+    print(f"    Seq Length:    {len(lma_features[first_key])}")
 
-    # 2. Digital Twin Video
-    # Note: Ensure 'all_joints' contains clean (N, 3) arrays, not None
+    # 3. Save for Classification
+    output_filename = "lma_features_output.npy"
+    
+    # [NOTE] np.save wraps the dict in a generic object array. 
+    # When loading later, use: data = np.load(..., allow_pickle=True).item()
+    np.save(output_filename, lma_features)
+    print(f"    Saved features to: {output_filename}")
+    
+    verify_lma_integrity("lma_features_output.npy")
+
+    print("\n--- GENERATING VISUAL DEBUG ASSETS ---")
     render_comprehensive_dashboard(
         video_path, 
         all_joints, 
