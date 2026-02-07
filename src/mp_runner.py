@@ -17,15 +17,19 @@ def worker_process(gpu_id, queue, output_dir, viz):
     2. Consumes files from the queue until empty
     """
     process_name = mp.current_process().name
-    device = f"cuda:{gpu_id}"
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    device = f"cuda:0"
     print(f"[{process_name}] Launching on {device}...")
 
     # --- A. LOAD MODELS ONCE ---
     try:
         # Load NLF
-        nlf_model = torch.jit.load('models/nlf_l_multi_0.3.2.torchscript').to(device).eval()
+        nlf_model = torch.jit.load('models/nlf_l_multi_0.3.2.torchscript', map_location=device).eval()
         # Load MoGe
-        moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
+        with torch.cuda.device(device):
+            moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
         print(f"[{process_name}] Models loaded. Ready to work.")
     except Exception as e:
         print(f"[{process_name}] CRITICAL MODEL LOAD FAIL: {e}")
