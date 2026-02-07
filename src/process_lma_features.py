@@ -1,7 +1,10 @@
 import torch
 import torchvision
 import numpy as np
+import argparse
 import cv2
+import os
+import glob
 from sklearn.linear_model import QuantileRegressor
 from scipy.spatial import ConvexHull
 from moge.model.v2 import MoGeModel
@@ -133,7 +136,7 @@ def verify_pipeline_integrity(all_joints, all_volumes, floor_model):
 import numpy as np
 import matplotlib.pyplot as plt
 
-def verify_lma_integrity(npy_path):
+def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png"):
     print(f"--- VERIFYING: {npy_path} ---")
     
     # [FIX] Load Dictionary format properly
@@ -205,10 +208,10 @@ def verify_lma_integrity(npy_path):
     dead_count = 0
     for k in keys:
         var = np.var(data[k])
-        if var < 1e-6:
+        if np.std(data[k]) < 1e-5:  # Checking Std Dev is more intuitive than Variance
             print(f"    [!] WARNING: Feature '{k}' is static (Zero Variance).")
             dead_count += 1
-            
+
     if dead_count == 0:
         print("    [OK] All features show temporal evolution.")
 
@@ -232,25 +235,27 @@ def verify_lma_integrity(npy_path):
     plt.legend()
     plt.grid(True, alpha=0.3)
     
-    output_img = "lma_verification_plot.png"
-    plt.savefig(output_img)
-    print(f"    Saved plot to {output_img}")
+    plt.savefig(plot_output_path)
+    print(f"    Saved plot to {plot_output_path}")
+    plt.close()
 
-def main():
-    video_path = "/home/sogang/mnt/db_1/jaehoon/aist/gBR_sBM_c01_d04_mBR0_ch01.mp4"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print("Loading Models...")
-    nlf_model = torch.jit.load('models/nlf_l_multi_0.3.2.torchscript').to(device).eval()
-    # [cite_start]Load MoGe-v2 (The authors chose MoGe for ground surface quality [cite: 85])
-    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
+def process_single_video(video_path, output_dir, nlf_model, moge_model, device="cuda", viz=False):
+    # Create dynamic filenames based on the specific video name
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    print(f"\nProcessing: {base_name}")
+
+    # Define unique output paths for this specific video
+    npy_output_path = os.path.join(output_dir, f"{base_name}_features.npy")
+    video_output_path = os.path.join(output_dir, f"{base_name}_debug.mp4")
+    plot_output_path = os.path.join(output_dir, f"{base_name}_plot.png")
 
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
     DEBUG_DURATION = 3.0 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0: fps = 30.0
+    if fps <= 0:
+        fps = 30.0
 
     all_joints = []
     all_volumes = []
@@ -381,26 +386,79 @@ def main():
     first_key = list(lma_features.keys())[0]
     print(f"    Seq Length:    {len(lma_features[first_key])}")
 
-    # 3. Save for Classification
-    output_filename = "lma_features_output.npy"
-    
     # [NOTE] np.save wraps the dict in a generic object array. 
     # When loading later, use: data = np.load(..., allow_pickle=True).item()
-    np.save(output_filename, lma_features)
-    print(f"    Saved features to: {output_filename}")
+    np.save(npy_output_path, lma_features)
+    print(f"    Saved features to: {npy_output_path}")
     
-    verify_lma_integrity("lma_features_output.npy")
+    verify_lma_integrity(npy_output_path, plot_output_path=plot_output_path)
 
-    print("\n--- GENERATING VISUAL DEBUG ASSETS ---")
-    render_comprehensive_dashboard(
-        video_path, 
-        all_joints, 
-        all_vertices, 
-        all_floor_models, 
-        scene_cloud,
-        lma_features=lma_features,
-        output_path="debug_short_clip.mp4"
-    )
+    if viz:
+        print("\n--- GENERATING VISUAL DEBUG ASSETS ---")
+        render_comprehensive_dashboard(
+            video_path, 
+            all_joints, 
+            all_vertices, 
+            all_floor_models, 
+            scene_cloud,
+            lma_features=lma_features,
+            output_path=video_output_path
+        )
+
+
+def main():
+    # 1. SETUP ARGUMENTS
+    parser = argparse.ArgumentParser(description="Batch LMA Extraction")
+    
+    # Changed from 'input_dir' to 'input_path' to be more accurate
+    parser.add_argument("--input_path", type=str, required=True,
+                        help="Path to a single .mp4 file OR a folder of files")
+    
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="Folder to save results")
+    
+    parser.add_argument("--viz", action="store_true", 
+                        help="Enable debug video generation")
+
+    args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # 2. DETERMINE INPUT TYPE
+    video_files = []
+    if os.path.isfile(args.input_path):
+        # User provided a single file
+        video_files = [args.input_path]
+    elif os.path.isdir(args.input_path):
+        # User provided a folder
+        video_files = glob.glob(os.path.join(args.input_path, "*.mp4"))
+    else:
+        print(f"Error: {args.input_path} is not a valid file or directory.")
+        return
+
+    print(f"Found {len(video_files)} items to process.")
+
+    # 3. LOAD MODELS (Once per process)
+    print("Loading Models...")
+    nlf_model = torch.jit.load('models/nlf_l_multi_0.3.2.torchscript').to(device).eval()
+    moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
+
+    # 4. RUN SEQUENTIALLY
+    # (If run by external MP script, this list will just contain 1 item)
+    for video_path in video_files:
+        try:
+            process_single_video(
+                video_path, 
+                args.output_dir, 
+                nlf_model, 
+                moge_model, 
+                device, 
+                viz=args.viz
+            )
+        except Exception as e:
+            print(f"Failed on {video_path}: {e}")
 
 if __name__ == "__main__":
     main()
