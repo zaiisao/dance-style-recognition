@@ -21,7 +21,7 @@ def worker_process(gpu_id, queue, output_dir, viz):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
     device = f"cuda:0"
-    print(f"[{process_name}] Launching on {device}...")
+    print(f"[{process_name}] Launching on GPU {str(gpu_id)}...")
 
     # --- A. LOAD MODELS ONCE ---
     try:
@@ -77,13 +77,28 @@ def main():
     mp.set_start_method('spawn', force=True) # Critical for CUDA
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 2. Collect Videos
+    # 2. Collect Videos & Filter Existing
     print(f"Scanning {args.input_dir}...")
-    video_files = glob.glob(os.path.join(args.input_dir, "*.mp4"))
+    all_files = glob.glob(os.path.join(args.input_dir, "*.mp4"))
+    
+    # Filter list: Only keep videos where the output .npy doesn't exist yet
+    video_files = []
+    for v in all_files:
+        base_name = os.path.splitext(os.path.basename(v))[0]
+        expected_npy = os.path.join(args.output_dir, f"{base_name}_features.npy")
+        
+        if not os.path.exists(expected_npy):
+            video_files.append(v)
+
     total_files = len(video_files)
-    print(f"Found {total_files} videos.")
+    skipped_count = len(all_files) - total_files
+
+    print(f"Found {len(all_files)} total videos.")
+    print(f"Skipping {skipped_count} already processed.")
+    print(f"Queueing {total_files} new videos.")
 
     if total_files == 0:
+        print("All files up to date. Exiting.")
         return
 
     # 3. Fill Queue
