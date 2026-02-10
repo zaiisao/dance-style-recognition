@@ -67,6 +67,7 @@ def worker_process(gpu_id, queue, output_dir, viz):
 def main():
     parser = argparse.ArgumentParser(description="Multi-GPU Master Runner")
     parser.add_argument("--input_dir", type=str, required=True, help="Folder containing .mp4 files")
+    parser.add_argument("--input_file", type=str, help="Optional: .txt file containing specific filenames to process")
     parser.add_argument("--output_dir", type=str, required=True, help="Folder to save results")
     parser.add_argument("--workers_per_gpu", type=int, default=6, 
                         help="Number of parallel processes per GPU. (Default: 6)")
@@ -78,12 +79,26 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 2. Collect Videos & Filter Existing
-    print(f"Scanning {args.input_dir}...")
-    all_files = glob.glob(os.path.join(args.input_dir, "*.mp4"))
+    all_files = []
+    if args.input_file:
+        print(f"Reading video list from {args.input_file}...")
+        with open(args.input_file, 'r') as f:
+            # Read lines, strip whitespace, and ignore empty lines
+            filenames = [line.strip() for line in f if line.strip()]
+            for name in filenames:
+                # If the file in the TXT isn't an absolute path, join it with input_dir
+                full_path = name if os.path.isabs(name) else os.path.join(args.input_dir, name)
+                all_files.append(full_path)
+    else:
+        print(f"Scanning {args.input_dir}...")
+        all_files = glob.glob(os.path.join(args.input_dir, "*.mp4"))
     
     # Filter list: Only keep videos where the output .npy doesn't exist yet
     video_files = []
     for v in all_files:
+        if not os.path.exists(v):
+            print(f"Warning: File not found, skipping: {v}")
+            continue
         base_name = os.path.splitext(os.path.basename(v))[0]
         expected_npy = os.path.join(args.output_dir, f"{base_name}_features.npy")
         

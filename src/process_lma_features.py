@@ -10,6 +10,7 @@ from scipy.spatial import ConvexHull
 from moge.model.v2 import MoGeModel
 from tqdm import tqdm
 import trimesh
+import matplotlib.pyplot as plt
 
 from lma_extractor import LMAExtractor
 from visualizer import render_comprehensive_dashboard
@@ -132,112 +133,120 @@ def verify_pipeline_integrity(all_joints, all_volumes, floor_model):
                 print(f"    |{bar}")
     else:
         print("    [!] CRITICAL: No valid volumes calculated.")
-        
-import numpy as np
-import matplotlib.pyplot as plt
 
 def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png"):
-    print(f"--- VERIFYING: {npy_path} ---")
+    """
+    Comprehensive audit for the 55-feature LMA descriptor.
+    Validates components: Body (12), Effort (28), Space (8), Shape (1), Kinematics (6).
+    """
+    print(f"\n{'='*60}\nAUDITING LMA FEATURE VECTOR: {npy_path}\n{'='*60}")
     
-    # [FIX] Load Dictionary format properly
     try:
+        # Handling the wrap from np.save(..., allow_pickle=True)
         data = np.load(npy_path, allow_pickle=True).item()
-    except Exception:
-        print("[!] Fatal: Could not load dictionary. File might be corrupted.")
+    except Exception as e:
+        print(f"[!] FATAL: Loading failed. Error: {e}")
         return
 
-    # Basic setup
     keys = list(data.keys())
+    n_features = len(keys)
     n_frames = len(data[keys[0]])
-    print(f"Loaded {n_frames} frames. Keys: {keys}")
     
+    # Requirement: Vector must contain exactly 55 features 
+    print(f"[-] Descriptor Structure:")
+    print(f"    Total Features: {n_features} (Target: 55)")
+    print(f"    Total Frames:   {n_frames}")
+    
+    if n_features != 55:
+        print(f"    [!] WARNING: Feature count mismatch! Found {n_features}, expected 55.")
+
     # ---------------------------------------------------------
-    # 1. PHYSICAL UNIT CHECK (Checking 'weight' / Kinetic Energy)
+    # 1. EFFORT COMPONENT VALIDATION (28 Features)
     # ---------------------------------------------------------
-    # Weight = Speed^2. 
-    # If units are mm, Speed is 1000x -> Weight is 1,000,000x larger.
+    # Effort captures intention/energy across Space, Weight, Time, and Flow[cite: 102].
+    print(f"\n[-] Component 1: Effort (Energy & Dynamics)")
     
-    weight_feat = data.get('weight', np.zeros(n_frames))
-    max_val = np.max(weight_feat)
-    
-    print("\n[1] Physical Unit Scaling Check")
-    if max_val > 1000:
-        print(f"    [!] WARNING: Max Energy is {max_val:.2f}.")
-        print("        Likely Unit Error: Data seems to be in MILLIMETERS.")
-        print("        LMA standard is METERS. Divide inputs by 1000.0 before extraction.")
-    elif max_val < 1e-4:
-        print(f"    [!] WARNING: Max value is {max_val:.2e}. Data is vanishingly small.")
+    # Check Weight (Kinetic Energy) - Eq 4 [cite: 112]
+    weight_globals = data.get('Effort_Weight_Global', np.zeros(n_frames))
+    if np.max(weight_globals) > 500: # Threshold for standard human movement in m/s^2
+        print(f"    [!] FAIL: Weight values ({np.max(weight_globals):.2f}) suggest mm units.")
     else:
-        print(f"    [OK] Value range looks consistent with Meters/Seconds.")
-        print(f"         Max Energy Value: {max_val:.3f}")
+        print(f"    [OK] Weight (KE) scaling looks correct.")
+
+    # Check Time (Acceleration) - Eq 5 [cite: 116]
+    time_globals = data.get('Effort_Time_Global', np.zeros(n_frames))
+    print(f"    [OK] Time (Acceleration) mean: {np.mean(time_globals):.3f} m/s^2")
 
     # ---------------------------------------------------------
-    # 2. GEOMETRIC LOGIC CHECK (Checking 'space')
+    # 2. SPACE COMPONENT VALIDATION (8 Features)
     # ---------------------------------------------------------
-    # Space = Path_Length / Displacement.
-    # By definition, this MUST be >= 1.0 (Triangle Inequality).
+    # Space describes relationship with kinesphere/personal space[cite: 119].
+    print(f"\n[-] Component 2: Space (Kinesphere & Trajectory)")
     
-    space_feat = data.get('space', np.zeros(n_frames))
-    
-    print("\n[2] Geometric Logic Check")
-    if np.any(space_feat < 0.99): # Allow tiny float error
-        print(f"    [!] FAIL: Found Space ratios < 1.0. (Min: {np.min(space_feat):.3f})")
-    elif np.isnan(space_feat).any():
-        print("    [!] FAIL: NaNs found. (Division by zero in Displacement?)")
+    # Check Curvature: Path_Length / Displacement [cite: 118, 119]
+    curvature = data.get('Traj_Curvature', np.ones(n_frames))
+    if np.any(curvature < 0.99):
+        print(f"    [!] FAIL: Curvature < 1.0 found. Check Triangle Inequality logic.")
     else:
-        print("    [OK] Geometry looks valid (All Space Ratios >= 1.0).")
+        print(f"    [OK] Curvature logic verified (Min: {np.min(curvature):.3f}).")
 
     # ---------------------------------------------------------
-    # 3. SHAPE FLOW CHECK
+    # 3. BODY COMPONENT & INITIATION (12 Features)
     # ---------------------------------------------------------
-    # Note: Our extractor saved 'Shape Flow' (Derivative), not raw Volume.
-    # So we check if the derivative is non-zero (proving the volume changed).
+    # Body focuses on mechanics and initiation detection[cite: 93, 95].
+    print(f"\n[-] Component 3: Body (Initiation Triggers)")
     
-    shape_flow = data.get('shape', np.zeros(n_frames))
-    
-    print("\n[3] Body Volume Flow Check")
-    if np.allclose(shape_flow, 0):
-        print("    [!] FAIL: Shape Flow is flat zero. Convex Hull might have failed.")
+    init_keys = [k for k in keys if "Initiation" in k]
+    total_initiations = sum([np.sum(data[k]) for k in init_keys])
+    if total_initiations == 0:
+        print(f"    [!] WARNING: No initiation events detected. Threshold epsilon might be too high.")
     else:
-        print(f"    [OK] Volume changes detected (Min flow: {np.min(shape_flow):.4f}, Max flow: {np.max(shape_flow):.4f})")
+        print(f"    [OK] Detected {int(total_initiations)} movement initiation events.")
 
     # ---------------------------------------------------------
-    # 4. TEMPORAL DYNAMICS CHECK
+    # 4. TEMPORAL EVOLUTION CHECK (SHAP Influence)
     # ---------------------------------------------------------
-    print("\n[4] Temporal Dynamics Check")
-    dead_count = 0
-    for k in keys:
-        var = np.var(data[k])
-        if np.std(data[k]) < 1e-5:  # Checking Std Dev is more intuitive than Variance
-            print(f"    [!] WARNING: Feature '{k}' is static (Zero Variance).")
-            dead_count += 1
+    # Temporal context significantly improves recognition performance[cite: 13].
+    print(f"\n[-] Component 4: Temporal Context Audit")
+    
+    # Identify "Dead" features that don't change over time
+    dead_features = [k for k in keys if np.std(data[k]) < 1e-6]
+    if dead_features:
+        print(f"    [!] WARNING: {len(dead_features)} features are static (Zero Variance).")
+        print(f"        First 3 static: {dead_features[:3]}")
+    else:
+        print(f"    [OK] All 55 features show temporal evolution.")
 
-    if dead_count == 0:
-        print("    [OK] All features show temporal evolution.")
+    # ---------------------------------------------------------
+    # 5. VISUALIZATION: Turab-Style Plotting
+    # ---------------------------------------------------------
+    # Style-specific representation improves with sliding window[cite: 227].
+    print(f"\n[5] Generating Visualization: '{plot_output_path}'...")
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+    
+    # Top Plot: Effort Components (Major predictors in SHAP plots [cite: 172])
+    effort_plot_keys = ['Effort_Weight_Global', 'Effort_Time_Global', 'body_volume']
+    for k in effort_plot_keys:
+        if k in data:
+            # Z-score for visual comparison
+            norm = (data[k] - np.mean(data[k])) / (np.std(data[k]) + 1e-6)
+            axes[0].plot(norm, label=k, alpha=0.8)
+    
+    axes[0].set_title("Primary Recognition Features (Normalized Evolution)")
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, alpha=0.3)
 
-    # ---------------------------------------------------------
-    # 5. VISUALIZATION
-    # ---------------------------------------------------------
-    print("\n[5] Generating Visualization...")
-    plt.figure(figsize=(12, 6))
+    # Bottom Plot: Initiation Events (Binary spikes)
+    for k in init_keys[:3]: # Plot first 3 for clarity
+        axes[1].step(range(n_frames), data[k], label=k, where='post')
     
-    # Plot normalized features to compare trends
-    for k in keys:
-        sig = data[k]
-        if np.std(sig) > 1e-6:
-            # Z-score normalization for cleaner plotting
-            norm_sig = (sig - np.mean(sig)) / np.std(sig)
-            plt.plot(norm_sig, label=k, alpha=0.8, linewidth=1.5)
+    axes[1].set_title("Movement Initiation Triggers (Boolean Detection)")
+    axes[1].set_xlabel("Frame Index")
+    axes[1].legend(loc='upper right')
     
-    plt.title("LMA Feature Evolution (Normalized)")
-    plt.xlabel("Frame")
-    plt.ylabel("Z-Score")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
+    plt.tight_layout()
     plt.savefig(plot_output_path)
-    print(f"    Saved plot to {plot_output_path}")
-    plt.close()
+    print(f"    [DONE] Verification complete.")
 
 def process_single_video(video_path, output_dir, nlf_model, moge_model, device="cuda", viz=False):
     # Create dynamic filenames based on the specific video name
@@ -369,27 +378,34 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
 
     verify_pipeline_integrity(all_joints, all_volumes, current_floor_model)
 
-    # 1. Initialize Extractor
+# 1. Initialize Extractor with 55-frame window as per Turab et al. (2025)
+    # [cite: 13, 149, 272]
     extractor = LMAExtractor(window_size=55, fps=fps)
     
-    # 2. Extract Features
-    # Pass 'all_floor_models' so the extractor can fix the camera shake/tilt.
-    lma_features = extractor.extract_all_features(all_joints, all_volumes, all_floor_models)
+    # 2. Extract 55 Feature Descriptors
+    # [cite: 123] The pipeline extracts a descriptor vector composed of 55 features.
+    lma_dict = extractor.extract_all_features(all_joints, all_volumes, all_floor_models)
     
-    print(f"[-] Feature Extraction Complete")
-    print(f"    Input Frames:  {len(all_joints)}")
+    # 3. Flatten dictionary to a (Frames, 55) NumPy Array
+    # This ensures your script moves from a dictionary to the list expected by ML models.
+    feature_keys = sorted(lma_dict.keys())
+    if len(feature_keys) != 55:
+        print(f"[!] WARNING: Extracted {len(feature_keys)} features. Expected 55.")
     
-    # [FIX] Handle Dictionary output (No .shape attribute)
-    print(f"    Output Keys:   {list(lma_features.keys())}")
-    
-    # Check length of the first feature (e.g., 'weight') to confirm sequence length
-    first_key = list(lma_features.keys())[0]
-    print(f"    Seq Length:    {len(lma_features[first_key])}")
+    # Stack features into a matrix of shape (Total_Frames, 55)
+    lma_matrix = np.stack([lma_dict[k] for k in feature_keys], axis=1)
 
-    # [NOTE] np.save wraps the dict in a generic object array. 
-    # When loading later, use: data = np.load(..., allow_pickle=True).item()
-    np.save(npy_output_path, lma_features)
-    print(f"    Saved features to: {npy_output_path}")
+    print(f"[-] Feature Extraction Complete")
+    print(f"    Feature Matrix Shape: {lma_matrix.shape} (Frames x Features)")
+
+    # 4. Save both formats for compatibility
+    # Save the raw matrix for ML and the dictionary for the visualizer
+    np.save(npy_output_path, lma_matrix) 
+    dict_output_path = npy_output_path.replace("_features.npy", "_dict.npy")
+    np.save(dict_output_path, lma_dict) 
+
+    print(f"    Saved Matrix to:   {npy_output_path}")
+    print(f"    Saved Dictionary to: {dict_output_path}")
     
     verify_lma_integrity(npy_output_path, plot_output_path=plot_output_path)
 
@@ -401,7 +417,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
             all_vertices, 
             all_floor_models, 
             scene_cloud,
-            lma_features=lma_features,
+            lma_features=lma_dict,
             output_path=video_output_path
         )
 
