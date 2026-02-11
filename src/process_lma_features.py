@@ -9,30 +9,20 @@ from sklearn.linear_model import QuantileRegressor
 from scipy.spatial import ConvexHull
 from moge.model.v2 import MoGeModel
 from tqdm import tqdm
-import trimesh
 import matplotlib.pyplot as plt
 
 from lma_extractor import LMAExtractor
 from visualizer import render_comprehensive_dashboard
 
 def stage_a_nlf_implementation(frame, model, device="cuda"):
-    # Preprocess image: Convert OpenCV (H, W, C) -> Torch (C, H, W)
-    # Replaces: image = torchvision.io.read_image(image_path).to(device)
-    if isinstance(frame, np.ndarray):
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).to(device)
-    else:
-        frame_tensor = frame.to(device)
-
-    # Maintain original batching logic
-    frame_batch = frame_tensor.unsqueeze(0).float() / 255.0
+    # Convert BGR to RGB and move to GPU in one pipeline
+    frame_tensor = torch.from_numpy(frame[..., ::-1].copy()).to(device)
+    frame_tensor = frame_tensor.permute(2, 0, 1).float() / 255.0
+    frame_batch = frame_tensor.unsqueeze(0)
 
     with torch.inference_mode():
-        # Using the batched detection method highlighted in your script 
         pred = model.detect_smpl_batched(frame_batch)
     
-    # [cite_start]Extract absolute 3D data required for LMA components [cite: 1, 10]
-    # 'joints3d' for Body/Effort/Space; 'vertices3d' for Shape (Volume)
     return pred['joints3d'], pred['vertices3d']
 
 def stage_b_floor_estimation(frame, model, device="cuda"):
@@ -270,6 +260,8 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
     all_volumes = []
     all_vertices = []
     all_floor_models = []
+    pelvis_depths = []
+    pelvis_y_vals = []
     scene_cloud = None
 
     last_valid_volume = 0.0
@@ -325,31 +317,40 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
                 current_vol = last_valid_volume
                 
                 if len(vertices3d) > 0 and len(vertices3d[0]) > 0:
-                    verts_np = vertices3d[0].cpu().numpy()
-                    joints_np = joints3d[0].cpu().numpy()
+                    # 1. Fetch from GPU ONCE
+                    verts_np = vertices3d[0].detach().cpu().numpy()
+                    joints_np = joints3d[0].detach().cpu().numpy()
                     
-                    if verts_np.ndim == 3:
-                        verts_np = verts_np[0]
-                    if joints_np.ndim == 3:
-                        joints_np = joints_np[0]
+                    # 2. Handle dimensions
+                    if verts_np.ndim == 3: verts_np = verts_np[0]
+                    if joints_np.ndim == 3: joints_np = joints_np[0]
                     
+                    # 3. Apply Scaling to the CPU copy (mm -> meters)
+                    # This ensures both the visualizer AND the volume calc get the scaled data
                     if np.mean(np.abs(verts_np[:, 2])) > 10.0: 
                         verts_np /= 1000.0
                         joints_np /= 1000.0
-                    
-                    all_vertices.append(verts_np)
 
-                    # Volume Calculation
+                    # 4. Save for Viz
+                    if viz:
+                        all_vertices.append(verts_np.astype(np.float16))
+                    else:
+                        all_vertices.append(None)
+
+                    # 5. Calculate Volume (Reuse verts_np)
                     try:
-                        # Trimesh is robust, but don't force 'is_watertight' for open clothing meshes
-                        mesh = trimesh.convex.convex_hull(verts_np)
-                        current_vol = mesh.volume
-                        last_valid_volume = current_vol
+                        if verts_np.shape[0] > 3: # ConvexHull needs >3 points
+                            hull = ConvexHull(verts_np)
+                            current_vol = hull.volume
+                        else:
+                            current_vol = 0.0
                     except Exception:
-                        # If it fails, rely on the last known good volume (gap filling)
-                        pass
+                        current_vol = last_valid_volume
+                    
+                    last_valid_volume = current_vol
                 else:
-                    all_vertices.append(None)
+                    if viz:
+                        all_vertices.append(None)
                 
                 if joints_np is not None:
                     all_joints.append(joints_np)
@@ -358,22 +359,34 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
                 
                 all_volumes.append(current_vol)
 
-                # --- METRICS ---
                 if joints_np is not None:
-                    pelvis_pos = joints_np[0] 
-                    
-                    # Predict Floor Y (Height) at Pelvis Z (Depth)
-                    floor_y = current_floor_model.predict(pelvis_pos[2].reshape(-1, 1))[0]
-                    height_above_floor = floor_y - pelvis_pos[1]
-                    
-                    pbar.set_postfix(h=f"{height_above_floor:.2f}m", vol=f"{current_vol:.3f}")
+                    pelvis_depths.append(joints_np[0, 2]) # Pelvis Z
+                    pelvis_y_vals.append(joints_np[0, 1])  # Pelvis Y
+                    pbar.set_postfix(vol=f"{current_vol:.3f}")
                 else:
-                    pbar.set_postfix(status="No Det")
+                    # Keep the lists the same length as all_joints
+                    pelvis_depths.append(np.nan)
+                    pelvis_y_vals.append(np.nan)
                 
                 frame_idx += 1
                 pbar.update(1)
                 
         cap.release()
+
+        if len(pelvis_depths) > 0:
+            z_array = np.array(pelvis_depths).reshape(-1, 1)
+            # Filter frames where detection was successful
+            valid_mask = ~np.isnan(pelvis_depths)
+            
+            if np.any(valid_mask):
+                # One single call for the entire video
+                all_floor_ys = current_floor_model.predict(z_array[valid_mask])
+                actual_pelvis_ys = np.array(pelvis_y_vals)[valid_mask]
+                
+                # Calculate all heights at once
+                all_heights = all_floor_ys - actual_pelvis_ys
+                print(f"[-] Mean grounding height: {np.mean(all_heights):.3f}m")
+
         print("Video processing complete.")
 
     verify_pipeline_integrity(all_joints, all_volumes, current_floor_model)
@@ -398,8 +411,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
     print(f"[-] Feature Extraction Complete")
     print(f"    Feature Matrix Shape: {lma_matrix.shape} (Frames x Features)")
 
-    # 4. Save both formats for compatibility
-    # Save the raw matrix for ML and the dictionary for the visualizer
+    # 4. Save both formats
     np.save(npy_output_path, lma_matrix) 
     dict_output_path = npy_output_path.replace("_features.npy", "_dict.npy")
     np.save(dict_output_path, lma_dict) 
@@ -407,7 +419,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
     print(f"    Saved Matrix to:   {npy_output_path}")
     print(f"    Saved Dictionary to: {dict_output_path}")
     
-    verify_lma_integrity(npy_output_path, plot_output_path=plot_output_path)
+    verify_lma_integrity(dict_output_path, plot_output_path=plot_output_path)
 
     if viz:
         print("\n--- GENERATING VISUAL DEBUG ASSETS ---")

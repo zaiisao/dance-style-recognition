@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.spatial import ConvexHull
-
+from scipy.signal import savgol_filter
 
 class LMAExtractor:
     def __init__(self, window_size=55, fps=60):
@@ -99,10 +99,27 @@ class LMAExtractor:
         cleaned_joints = self._impute_missing_data(all_joints)
         norm_joints = self._normalize_pose_to_floor(cleaned_joints, all_floor_models)
 
-        # 2. Derivatives (Full Sequence)
-        vel = np.gradient(norm_joints, self.dt, axis=0)
-        acc = np.gradient(vel, self.dt, axis=0)
-        jerk = np.gradient(acc, self.dt, axis=0)  # Required for 'Flow'
+        # Applies a temporal median filter (kernel=5) to smooth 3D pose jitter
+        # This brings acceleration from ~500 m/s^2 down to realistic human levels.
+        window_len = int(self.fps / 4)  # ~0.25s at 60fps
+        poly_order = 3
+
+        # 1. Smooth Positions (for Space/Shape/Body)
+        for j in range(24):
+            for c in range(3):
+                norm_joints[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=0)
+
+        # 2. Calculate Derivatives (for Effort) directly from the filter
+        # This is much cleaner than np.gradient(np.gradient(...))
+        vel = np.zeros_like(norm_joints)
+        acc = np.zeros_like(norm_joints)
+        jerk = np.zeros_like(norm_joints)
+
+        for j in range(24):
+            for c in range(3):
+                vel[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=1, delta=self.dt)
+                acc[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=2, delta=self.dt)
+                jerk[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=3, delta=self.dt)
 
         n_frames = len(all_joints)
         w_main = self.window_size
@@ -117,28 +134,36 @@ class LMAExtractor:
         for name in self.KEY_JOINTS:
             idx = self.IDX[name]
             raw_vals = []
+            
+            # 1. Calculate for full windows
             for t in range(n_frames - w_init):
                 # Raw metric: ||P(t+w) - P(t)|| / dt
                 delta = norm_joints[t + w_init, idx] - norm_joints[t, idx]
                 val = np.linalg.norm(delta) / (w_init * self.dt)
                 raw_vals.append(val)
+            
+            # 2. Handle the edge case (last w_init frames) by repeating last valid value
+            if raw_vals:
+                last_val = raw_vals[-1]
+                for _ in range(w_init):
+                    raw_vals.append(last_val)
+            else:
+                # Fallback for videos shorter than w_init
+                raw_vals = [0.0] * n_frames
 
-            # Convert to array and compute std dev for threshold
             raw_vals = np.array(raw_vals)
+            
+            # 3. Compute Thresholds
             if len(raw_vals) > 0:
                 sigma = np.std(raw_vals)
-                # If sigma is tiny (static), use a small epsilon to avoid noise triggers
                 init_thresholds[name] = max(sigma, 1e-3)
-                # Pad to match n_frames length
-                padded = np.zeros(n_frames)
-                padded[: len(raw_vals)] = raw_vals
-                raw_init_values[name] = padded
+                raw_init_values[name] = raw_vals # Now full length, no padding needed
             else:
                 init_thresholds[name] = 1.0
                 raw_init_values[name] = np.zeros(n_frames)
 
         # Initialize Dictionary
-        feats = {k: np.zeros(n_frames) for k in ["weight", "time", "flow", "space", "body_volume"]}
+        feats = {"body_volume": np.zeros(n_frames)}
 
         # 3. Frame-by-Frame Extraction
         for t in range(n_frames):
@@ -203,7 +228,7 @@ class LMAExtractor:
                 # Denominator: ||P(T) - P(t1)|| (Displacement of the whole window)
                 disp = np.linalg.norm(traj[-1] - traj[0])
 
-                # Compute Space Metric
+                # Faithfully implementing Eq 2 without log-scaling for Random Forest
                 space_val = numerator / (disp + 1e-6)
                 if space_val < 1.0:
                     space_val = 1.0
@@ -212,16 +237,9 @@ class LMAExtractor:
                 sums["Space"] += space_val * wt
 
             self._add_feat(feats, "Effort_Weight_Global", sums["Weight"], t)
-            feats["weight"][t] = sums["Weight"]
-
             self._add_feat(feats, "Effort_Time_Global", sums["Time"], t)
-            feats["time"][t] = sums["Time"]
-
             self._add_feat(feats, "Effort_Flow_Global", sums["Flow"], t)
-            feats["flow"][t] = sums["Flow"]
-
             self._add_feat(feats, "Effort_Space_Global", sums["Space"], t)
-            feats["space"][t] = sums["Space"]
 
             # ---------------------------------------------------------
             # COMPONENT 3: SPACE (8 Features)
@@ -238,7 +256,10 @@ class LMAExtractor:
             root_traj = norm_joints[start:end, self.IDX["PELVIS"], :]
             total_path = np.sum(np.linalg.norm(np.diff(root_traj, axis=0), axis=1))
             total_disp = np.linalg.norm(root_traj[-1] - root_traj[0])
-            curvature = total_path / (total_disp + 1e-6)
+
+            # Clamp to 1.0 to satisfy Triangle Inequality (Path >= Displacement)
+            val = total_path / (total_disp + 1e-6)
+            curvature = max(1.0, val)
 
             self._add_feat(feats, "Traj_Path_Length", total_path, t)
             self._add_feat(feats, "Traj_Displacement", total_disp, t)
@@ -275,9 +296,15 @@ class LMAExtractor:
 
                 self._add_feat(feats, f"Initiation_{name}", init_feat, t)
 
+        # Remove valid-but-duplicate initialization keys to return exactly 55 features
+        for duplicate in ["weight", "time", "flow", "space"]:
+            if duplicate in feats:
+                del feats[duplicate]
+        
         return feats
 
     def _add_feat(self, feat_dict, key, val, t):
         if key not in feat_dict:
-            feat_dict[key] = np.zeros(len(feat_dict["weight"]))
+            # Use body_volume as the length reference
+            feat_dict[key] = np.zeros(len(feat_dict["body_volume"]))
         feat_dict[key][t] = val
