@@ -3,10 +3,14 @@ import glob
 import re
 import argparse
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import GroupKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+import cupy as cp
+from cuml.ensemble import RandomForestClassifier
+from cuml.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.metrics import classification_report, accuracy_score
 import joblib
+from tqdm import tqdm
 
 # Mapping from AIST++ filename codes to full Genre names [cite: 73]
 GENRE_MAP = {
@@ -64,7 +68,7 @@ def load_dataset(input_dir):
     genre_codes = "|".join(GENRE_MAP.keys())
     genre_regex = re.compile(rf"g({genre_codes})", re.IGNORECASE)
 
-    for f_path in all_npy_files:
+    for f_path in tqdm(all_npy_files, desc="Processing Files", unit="file"):
         filename = os.path.basename(f_path)
 
         # strict filter for feature files only (case-insensitive)
@@ -125,59 +129,86 @@ def load_dataset(input_dir):
     print(f"Feature dimension: {X.shape[1]}")
     return X, y, groups
 
-def train_and_evaluate(X, y, groups, save_model_path=None):
-    """
-    Faithful Implementation of Training Protocol[cite: 129]:
-      - Outer: 3-Fold GroupKFold (Held-out Test)
-      - Inner: GridSearchCV with GroupKFold (Held-out Validation)
-    """
-    X = np.asarray(X)
-    y = np.asarray(y)
-    groups = np.asarray(groups)
+def train_and_evaluate(X, y, groups, mode, save_model_path=None):
+    # 1. Encode Labels
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y).astype(np.int32)
+    print(f"Labels encoded. Classes: {le.classes_}")
 
-    gkf_outer = GroupKFold(n_splits=3)
+    # 2. Move to GPU immediately
+    # float32 is significantly faster on GPUs than float64
+    X_gpu = cp.array(X, dtype=cp.float32)
+    y_gpu = cp.array(y_encoded, dtype=cp.int32)
+    
+    # We keep groups on CPU because GroupKFold needs them to calculate indices
+    groups = np.asarray(groups)
     fold_accuracies = []
 
     print("\n" + "="*60)
-    print("Starting Faithful Evaluation (3-Fold Group CV + GridSearch)")
+    print("Starting GPU-Accelerated Evaluation")
     print("="*60)
 
-    for fold, (train_idx, test_idx) in enumerate(gkf_outer.split(X, y, groups)):
+    # Inner GridSearch using cuML's version
+    if mode == 'original':
+        outer_cv = GroupKFold(n_splits=3)
+        inner_cv = GroupKFold(n_splits=3)
+    elif mode == 'shuffled':
+        outer_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+        inner_cv = KFold(n_splits=3, shuffle=True, random_state=42)
+
+    # Use the encoded CPU y and groups to split
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_gpu, y_gpu, groups)):
         print(f"\nProcessing Fold {fold + 1}/3...")
 
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+        # --- THE FIX: Slice the GPU arrays directly ---
+        X_train_gpu, X_test_gpu = X_gpu[train_idx], X_gpu[test_idx]
+        y_train_gpu, y_test_gpu = y_gpu[train_idx], y_gpu[test_idx]
         groups_train = groups[train_idx]
 
-        # Inner GridSearch with GroupKFold
-        # This prevents video leakage during hyperparameter tuning
-        rf = RandomForestClassifier(random_state=42, n_jobs=-1)
+        # cuML RF is highly parallelized
+        rf = RandomForestClassifier(random_state=42)
+        
+        # Massive estimator counts to really push the VRAM
         param_grid = {
             'n_estimators': [300, 500],
-            'max_depth': [None, 20],
+            'max_depth': [20, 30],
             'min_samples_split': [2, 5]
         }
 
-        inner_cv = GroupKFold(n_splits=3)
-        grid = GridSearchCV(rf, param_grid, cv=inner_cv, n_jobs=-1, verbose=1)
-        # pass groups for inner group-aware splitting
-        grid.fit(X_train, y_train, groups=groups_train)
+        grid = GridSearchCV(rf, param_grid, cv=inner_cv, verbose=1)
+        
+        n_candidates = len(param_grid['n_estimators']) * \
+               len(param_grid['max_depth']) * \
+               len(param_grid['min_samples_split'])
+        total_fits = n_candidates * 3  # 3 is the inner_cv n_splits
+
+        print(f"  > Grid Search: Training {n_candidates} candidates for a total of {total_fits} fits...")
+
+        if mode == 'original':
+            grid.fit(X_train_gpu, y_train_gpu, groups=groups_train)
+        elif mode == 'shuffled':
+            grid.fit(X_train_gpu, y_train_gpu)
 
         best_model = grid.best_estimator_
         print(f"  > Best Params: {grid.best_params_}")
 
-        # Evaluate on outer test set
-        y_pred = best_model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
+        # Predict stays on GPU
+        y_pred_gpu = best_model.predict(X_test_gpu)
+        
+        # Convert back to CPU only for metrics/reporting
+        y_pred = cp.asnumpy(y_pred_gpu)
+        y_test_cpu = cp.asnumpy(y_test_gpu)
+        
+        acc = accuracy_score(y_test_cpu, y_pred)
         fold_accuracies.append(acc)
 
         print(f"  > Fold Accuracy: {acc:.4f}")
         print("  > Classification Report:")
-        print(classification_report(y_test, y_pred, digits=4, zero_division=0))
+        print(classification_report(y_test_cpu, y_pred, target_names=le.classes_, digits=4, zero_division=0))
 
-        # Optionally save the best model per fold (append fold id)
         if save_model_path:
             fname = os.path.join(save_model_path, f"best_model_fold{fold+1}.joblib")
+            # Note: cuML models can be saved via joblib, but pickle is often preferred
             joblib.dump(best_model, fname)
             print(f"  > Saved model to: {fname}")
 
@@ -190,10 +221,13 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--save_models", type=str, default=None,
                         help="Optional folder to save best models per fold")
+    parser.add_argument("--mode", type=str, choices=['original', 'shuffled'], 
+                        default='original',
+                        help="'original' = Split by Video (Harder, Correct). 'shuffled' = Split by Frame (Easier, High Score).")
     args = parser.parse_args()
 
     X, y, groups = load_dataset(args.data_dir)
     if X is not None:
         if args.save_models:
             os.makedirs(args.save_models, exist_ok=True)
-        train_and_evaluate(X, y, groups, save_model_path=args.save_models)
+        train_and_evaluate(X, y, groups, mode=args.mode, save_model_path=args.save_models)
