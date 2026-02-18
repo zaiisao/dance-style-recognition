@@ -160,7 +160,7 @@ def train_and_evaluate(X, y, groups, mode, save_model_path=None):
     for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_gpu, y_gpu, groups)):
         print(f"\nProcessing Fold {fold + 1}/3...")
 
-        # --- THE FIX: Slice the GPU arrays directly ---
+        # Slice GPU arrays directly to avoid host copies
         X_train_gpu, X_test_gpu = X_gpu[train_idx], X_gpu[test_idx]
         y_train_gpu, y_test_gpu = y_gpu[train_idx], y_gpu[test_idx]
         groups_train = groups[train_idx]
@@ -208,7 +208,7 @@ def train_and_evaluate(X, y, groups, mode, save_model_path=None):
 
         if save_model_path:
             fname = os.path.join(save_model_path, f"best_model_fold{fold+1}.joblib")
-            # Note: cuML models can be saved via joblib, but pickle is often preferred
+            # cuML models can be saved via joblib; pickle is also common
             joblib.dump(best_model, fname)
             print(f"  > Saved model to: {fname}")
 

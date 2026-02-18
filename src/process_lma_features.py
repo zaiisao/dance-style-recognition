@@ -271,14 +271,14 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
         data = np.load("debug_data.npz", allow_pickle=True)
         all_joints = data['joints']
         all_volumes = data['volumes']
-        floor_params = data['floor'] # Now you have the (N, 2) array of slope/intercept
+        floor_params = data['floor'] # (N, 2) array of slope/intercept
 
         def recreate_floor_model(slope, intercept):
             # 1. Create a raw, untrained model
             model = QuantileRegressor()
             
             # 2. Manually inject the "learned" attributes
-            # Note: Scikit-learn expects coef_ to be an array, even for 1D
+            # Scikit-learn expects coef_ to be an array, even for 1D
             model.coef_ = np.array([slope]) 
             model.intercept_ = intercept
             
@@ -288,7 +288,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
             
             return model
 
-        # Usage Example with your loaded data:
+        # Example usage with the loaded data
         slope, intercept = floor_params[0] # Get frame 0
         floor_model = recreate_floor_model(slope, intercept)
     else:
@@ -304,9 +304,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
                 if frame_idx == 0:
                     current_floor_model, _, scene_cloud = stage_b_floor_estimation(frame, moge_model, device)
 
-                # EDIT 2: SYNC FIX
-                # We MUST append to this list EVERY frame, even if the model didn't update.
-                # This ensures len(all_floor_models) == len(all_joints).
+                # Keep frame-aligned floor models for downstream feature extraction.
                 all_floor_models.append(current_floor_model)
 
                 # --- STAGE A: Pose Estimation (Every Frame) ---
@@ -400,7 +398,7 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
     lma_dict = extractor.extract_all_features(all_joints, all_volumes, all_floor_models)
     
     # 3. Flatten dictionary to a (Frames, 55) NumPy Array
-    # This ensures your script moves from a dictionary to the list expected by ML models.
+    # This matches the matrix format expected by downstream models.
     feature_keys = sorted(lma_dict.keys())
     if len(feature_keys) != 55:
         print(f"[!] WARNING: Extracted {len(feature_keys)} features. Expected 55.")

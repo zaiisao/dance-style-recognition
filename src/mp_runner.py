@@ -8,7 +8,7 @@ from queue import Empty
 
 from process_lma_features import process_single_video
 
-# Import the Model Class (Same as in your original script)
+# Import the MoGe model class
 from moge.model.v2 import MoGeModel
 
 def worker_process(gpu_id, queue, output_dir, viz):
@@ -46,7 +46,7 @@ def worker_process(gpu_id, queue, output_dir, viz):
             break
 
         try:
-            # CALL YOUR FUNCTION
+            # Run single-video processing
             process_single_video(
                 video_path=video_path, 
                 output_dir=output_dir, 
