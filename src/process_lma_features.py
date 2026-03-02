@@ -14,6 +14,14 @@ import matplotlib.pyplot as plt
 from utils.lma_extractor import LMAExtractor
 from utils.visualizer import render_comprehensive_dashboard
 
+class IdentityFloor:
+    """Mock floor for consumers whose data is already ground-aligned (e.g., WHAM)."""
+    def predict(self, z):
+        # Force the output to be a flat 1D array of zeros
+        # This matches the shape of joints[i, :, 1] and fixes the broadcast error
+        z = np.array(z)
+        return np.zeros(z.shape[0])
+
 def stage_a_nlf_implementation(frame, model, device="cuda"):
     # Convert BGR to RGB and move to GPU in one pipeline
     frame_tensor = torch.from_numpy(frame[..., ::-1].copy()).to(device)
@@ -56,7 +64,7 @@ def stage_b_floor_estimation(frame, model, device="cuda"):
 
     return qr, valid_points, scene_cloud
 
-def verify_pipeline_integrity(all_joints, all_volumes, floor_model):
+def verify_pipeline_integrity(all_joints, all_volumes, all_floor_models):
     """
     Analyzes the captured data for physical consistency.
     """
@@ -81,12 +89,15 @@ def verify_pipeline_integrity(all_joints, all_volumes, floor_model):
 
     # 2. Geometric Grounding (Pelvis Height)
     pelvis_heights = []
-    for j in valid_frames:
+    for i, j in enumerate(valid_frames):
+        if len(j) == 0: continue
+
         # j is (24, 3), so j[0] is the Pelvis vector
-        pelvis_pos = j[0] 
+        pelvis_pos = j[0]
+        current_model = all_floor_models[i]
         
         # Predict Floor Y (Height) using Pelvis Z (Depth)
-        floor_y = floor_model.predict(pelvis_pos[2].reshape(-1, 1))[0]
+        floor_y = current_model.predict(pelvis_pos[2].reshape(-1, 1))[0]
         
         # Height = Floor Y (Bottom) - Pelvis Y (Top)
         h = floor_y - pelvis_pos[1]
@@ -238,6 +249,20 @@ def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png")
     plt.savefig(plot_output_path)
     print(f"    [DONE] Verification complete.")
 
+def compute_lma_descriptor(joints, volumes, floors, fps, window_size=55):
+    """
+    The 'Frozen' logic. Any external consumer (NLF, MoGe, or WHAM) 
+    can pass data here to get the 55-feature vector.
+    """
+    extractor = LMAExtractor(window_size=window_size, fps=fps)
+    lma_dict = extractor.extract_all_features(joints, volumes, floors)
+    
+    # Flatten to matrix
+    feature_keys = sorted(lma_dict.keys())
+    lma_matrix = np.stack([lma_dict[k] for k in feature_keys], axis=1)
+    
+    return lma_dict, lma_matrix
+
 def process_single_video(video_path, output_dir, nlf_model, moge_model, device="cuda", viz=False):
     # Create dynamic filenames based on the specific video name
     base_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -387,24 +412,13 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
 
         print("Video processing complete.")
 
-    verify_pipeline_integrity(all_joints, all_volumes, current_floor_model)
+    verify_pipeline_integrity(all_joints, all_volumes, all_floor_models)
 
-# 1. Initialize Extractor with 55-frame window as per Turab et al. (2025)
-    # [cite: 13, 149, 272]
-    extractor = LMAExtractor(window_size=55, fps=fps)
-    
-    # 2. Extract 55 Feature Descriptors
-    # [cite: 123] The pipeline extracts a descriptor vector composed of 55 features.
-    lma_dict = extractor.extract_all_features(all_joints, all_volumes, all_floor_models)
-    
-    # 3. Flatten dictionary to a (Frames, 55) NumPy Array
-    # This matches the matrix format expected by downstream models.
-    feature_keys = sorted(lma_dict.keys())
-    if len(feature_keys) != 55:
-        print(f"[!] WARNING: Extracted {len(feature_keys)} features. Expected 55.")
-    
-    # Stack features into a matrix of shape (Total_Frames, 55)
-    lma_matrix = np.stack([lma_dict[k] for k in feature_keys], axis=1)
+    lma_dict, lma_matrix = compute_lma_descriptor(
+        all_joints, all_volumes,
+        all_floor_models,
+        fps, window_size=55
+    )
 
     print(f"[-] Feature Extraction Complete")
     print(f"    Feature Matrix Shape: {lma_matrix.shape} (Frames x Features)")
