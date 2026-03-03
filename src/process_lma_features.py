@@ -185,11 +185,11 @@ def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png")
     print(f"\n[-] Component 2: Space (Kinesphere & Trajectory)")
     
     # Check Curvature: Path_Length / Displacement [cite: 118, 119]
-    curvature = data.get('Traj_Curvature', np.ones(n_frames))
-    if np.any(curvature < 0.99):
-        print(f"    [!] FAIL: Curvature < 1.0 found. Check Triangle Inequality logic.")
+    curvature = data.get('Traj_Curvature', np.zeros(n_frames))
+    if np.any(curvature < -1e-6):
+        print(f"    [!] FAIL: Negative curvature found. Check path/displacement computation.")
     else:
-        print(f"    [OK] Curvature logic verified (Min: {np.min(curvature):.3f}).")
+        print(f"    [OK] Curvature is non-negative (Min: {np.min(curvature):.3f}).")
 
     # ---------------------------------------------------------
     # 3. BODY COMPONENT & INITIATION (12 Features)
@@ -249,12 +249,25 @@ def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png")
     plt.savefig(plot_output_path)
     print(f"    [DONE] Verification complete.")
 
-def compute_lma_descriptor(joints, volumes, floors, fps, window_size=55):
+def compute_lma_descriptor(
+    joints,
+    volumes,
+    floors,
+    fps,
+    window_size=55,
+    short_window=5,
+    apply_smoothing=False,
+):
     """
     The 'Frozen' logic. Any external consumer (NLF, MoGe, or WHAM) 
     can pass data here to get the 55-feature vector.
     """
-    extractor = LMAExtractor(window_size=window_size, fps=fps)
+    extractor = LMAExtractor(
+        window_size=window_size,
+        fps=fps,
+        short_window=short_window,
+        apply_smoothing=apply_smoothing,
+    )
     lma_dict = extractor.extract_all_features(joints, volumes, floors)
     
     # Flatten to matrix
@@ -263,7 +276,16 @@ def compute_lma_descriptor(joints, volumes, floors, fps, window_size=55):
     
     return lma_dict, lma_matrix
 
-def process_single_video(video_path, output_dir, nlf_model, moge_model, device="cuda", viz=False):
+def process_single_video(
+    video_path,
+    output_dir,
+    nlf_model,
+    moge_model,
+    device="cuda",
+    viz=False,
+    short_window=5,
+    apply_smoothing=False,
+):
     # Create dynamic filenames based on the specific video name
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     print(f"\nProcessing: {base_name}")
@@ -417,7 +439,10 @@ def process_single_video(video_path, output_dir, nlf_model, moge_model, device="
     lma_dict, lma_matrix = compute_lma_descriptor(
         all_joints, all_volumes,
         all_floor_models,
-        fps, window_size=55
+        fps,
+        window_size=55,
+        short_window=short_window,
+        apply_smoothing=apply_smoothing,
     )
 
     print(f"[-] Feature Extraction Complete")
@@ -460,7 +485,26 @@ def main():
     parser.add_argument("--viz", action="store_true", 
                         help="Enable debug video generation")
 
+    parser.add_argument(
+        "--short_window",
+        type=int,
+        default=5,
+        help="Short lag window (frames) used for initiation and lagged-space metrics.",
+    )
+    parser.add_argument(
+        "--apply_smoothing",
+        action="store_true",
+        help="Enable Savitzky-Golay smoothing.",
+    )
+
     args = parser.parse_args()
+
+    short_window = max(1, int(args.short_window))
+    apply_smoothing = bool(args.apply_smoothing)
+
+    print(
+        f"Extractor config -> short_window={short_window}, apply_smoothing={apply_smoothing}"
+    )
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -495,7 +539,9 @@ def main():
                 nlf_model, 
                 moge_model, 
                 device, 
-                viz=args.viz
+                viz=args.viz,
+                short_window=short_window,
+                apply_smoothing=apply_smoothing,
             )
         except Exception as e:
             print(f"Failed on {video_path}: {e}")

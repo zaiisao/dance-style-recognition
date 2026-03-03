@@ -3,7 +3,7 @@ from scipy.spatial import ConvexHull
 from scipy.signal import savgol_filter
 
 class LMAExtractor:
-    def __init__(self, window_size=55, fps=60):
+    def __init__(self, window_size=55, fps=60, short_window=5, apply_smoothing=False):
         """
         Laban Movement Analysis Feature Extractor.
         Faithfully implements the 55-feature vector described in Turab et al. (2025),
@@ -12,6 +12,8 @@ class LMAExtractor:
         self.window_size = window_size
         self.fps = fps
         self.dt = 1.0 / fps if fps > 0 else 1.0 / 30.0
+        self.short_window = max(1, int(short_window))
+        self.apply_smoothing = apply_smoothing
 
         # Standard SMPL 24-joint topology
         self.IDX = {
@@ -99,27 +101,20 @@ class LMAExtractor:
         cleaned_joints = self._impute_missing_data(all_joints)
         norm_joints = self._normalize_pose_to_floor(cleaned_joints, all_floor_models)
 
-        # Applies a temporal median filter (kernel=5) to smooth 3D pose jitter
-        # This brings acceleration from ~500 m/s^2 down to realistic human levels.
-        window_len = int(self.fps / 4)  # ~0.25s at 60fps
-        poly_order = 3
+        if self.apply_smoothing:
+            window_len = int(self.fps / 4)
+            if window_len % 2 == 0:
+                window_len += 1
+            window_len = max(5, window_len)
+            poly_order = min(3, window_len - 2)
 
-        # 1. Smooth Positions (for Space/Shape/Body)
-        for j in range(24):
-            for c in range(3):
-                norm_joints[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=0)
+            for j in range(24):
+                for c in range(3):
+                    norm_joints[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=0)
 
-        # 2. Calculate Derivatives (for Effort) directly from the filter
-        # This is much cleaner than np.gradient(np.gradient(...))
-        vel = np.zeros_like(norm_joints)
-        acc = np.zeros_like(norm_joints)
-        jerk = np.zeros_like(norm_joints)
-
-        for j in range(24):
-            for c in range(3):
-                vel[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=1, delta=self.dt)
-                acc[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=2, delta=self.dt)
-                jerk[:, j, c] = savgol_filter(norm_joints[:, j, c], window_len, poly_order, deriv=3, delta=self.dt)
+        vel = np.gradient(norm_joints, self.dt, axis=0)
+        acc = np.gradient(vel, self.dt, axis=0)
+        jerk = np.gradient(acc, self.dt, axis=0)
 
         n_frames = len(all_joints)
         w_main = self.window_size
@@ -127,7 +122,7 @@ class LMAExtractor:
         # --- PRE-CALCULATE INITIATION THRESHOLDS (Equation 1 Correction) ---
         # [cite_start]"Threshold calculated using standard-deviation of the entire sequence" [cite: 98]
         # We calculate the raw initiation metric for the whole video first.
-        w_init = 5  # Short window for initiation
+        w_init = self.short_window
         init_thresholds = {}
         raw_init_values = {}
 
@@ -206,11 +201,9 @@ class LMAExtractor:
                 self._add_feat(feats, f"{name}_Jerk", j_mag, t)
                 sums["Flow"] += j_mag * wt
 
-                # D. Space (Lagged Directness) [Eq 2 Correction]
-                # [cite_start]"Sum of distances... ||P(t) - P(t-w)||... for a short time-window" [cite: 104-105]
-                # We interpret 'w' as a lag parameter distinct from window T.
-                # If w > 1, this measures volumetric "reach" rather than arc length.
-                w_lag = 5  # Lag of ~0.08s (5 frames @ 60fps)
+                # D. Space (Lagged Directness): paper Eq. Space_j(T)
+                # uses a short lag window w inside a sliding window T.
+                w_lag = self.short_window
 
                 traj = norm_joints[start:end, idx, :]  # Shape (Window_Len, 3)
                 win_len = len(traj)
@@ -228,10 +221,7 @@ class LMAExtractor:
                 # Denominator: ||P(T) - P(t1)|| (Displacement of the whole window)
                 disp = np.linalg.norm(traj[-1] - traj[0])
 
-                # Faithfully implementing Eq 2 without log-scaling for Random Forest
                 space_val = numerator / (disp + 1e-6)
-                if space_val < 1.0:
-                    space_val = 1.0
 
                 self._add_feat(feats, f"{name}_Directness", space_val, t)
                 sums["Space"] += space_val * wt
@@ -257,9 +247,7 @@ class LMAExtractor:
             total_path = np.sum(np.linalg.norm(np.diff(root_traj, axis=0), axis=1))
             total_disp = np.linalg.norm(root_traj[-1] - root_traj[0])
 
-            # Clamp to 1.0 to satisfy Triangle Inequality (Path >= Displacement)
-            val = total_path / (total_disp + 1e-6)
-            curvature = max(1.0, val)
+            curvature = total_path / (total_disp + 1e-6)
 
             self._add_feat(feats, "Traj_Path_Length", total_path, t)
             self._add_feat(feats, "Traj_Displacement", total_disp, t)
