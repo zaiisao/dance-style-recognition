@@ -249,9 +249,6 @@ def verify_lma_integrity(npy_path, plot_output_path="lma_verification_plot.png")
     plt.savefig(plot_output_path)
     print(f"    [DONE] Verification complete.")
 
-<<<<<<< HEAD
-def compute_lma_descriptor(joints, volumes, floors, fps, window_size=55):
-=======
 def compute_lma_descriptor(
     joints,
     volumes,
@@ -261,21 +258,16 @@ def compute_lma_descriptor(
     short_window=5,
     apply_smoothing=False,
 ):
->>>>>>> 086c2a44af5f1bc6d7b767bb5ba215c0c8c85235
     """
     The 'Frozen' logic. Any external consumer (NLF, MoGe, or WHAM) 
     can pass data here to get the 55-feature vector.
     """
-<<<<<<< HEAD
-    extractor = LMAExtractor(window_size=window_size, fps=fps)
-=======
     extractor = LMAExtractor(
         window_size=window_size,
         fps=fps,
         short_window=short_window,
         apply_smoothing=apply_smoothing,
     )
->>>>>>> 086c2a44af5f1bc6d7b767bb5ba215c0c8c85235
     lma_dict = extractor.extract_all_features(joints, volumes, floors)
     
     # Flatten to matrix
@@ -284,9 +276,6 @@ def compute_lma_descriptor(
     
     return lma_dict, lma_matrix
 
-<<<<<<< HEAD
-def process_single_video(video_path, output_dir, nlf_model, moge_model, device="cuda", viz=False):
-=======
 def process_single_video(
     video_path,
     output_dir,
@@ -297,7 +286,6 @@ def process_single_video(
     short_window=5,
     apply_smoothing=False,
 ):
->>>>>>> 086c2a44af5f1bc6d7b767bb5ba215c0c8c85235
     # Create dynamic filenames based on the specific video name
     base_name = os.path.splitext(os.path.basename(video_path))[0]
     print(f"\nProcessing: {base_name}")
@@ -451,14 +439,10 @@ def process_single_video(
     lma_dict, lma_matrix = compute_lma_descriptor(
         all_joints, all_volumes,
         all_floor_models,
-<<<<<<< HEAD
-        fps, window_size=55
-=======
         fps,
         window_size=55,
         short_window=short_window,
         apply_smoothing=apply_smoothing,
->>>>>>> 086c2a44af5f1bc6d7b767bb5ba215c0c8c85235
     )
 
     print(f"[-] Feature Extraction Complete")
